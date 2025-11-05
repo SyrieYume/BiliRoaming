@@ -1,0 +1,121 @@
+name: My Android CI
+
+on:
+  push:
+    branches: [ master ]
+  # 1允许手动从 Actions 页面触发构建
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: true
+      CCACHE_MAXSIZE: 1G
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: 17
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - uses: seanmiddleditch/gha-setup-ninja@master
+        with:
+          version: 1.12.0
+
+      # 捕获版本号，用于 Release 名称和标签
+      - name: Retrieve version and set tag/name
+        id: version_info
+        run: |
+          # 使用短提交 ID 作为应用的版本名称
+          COMMIT_HASH=$(echo ${{ github.sha }} | head -c 7)
+          echo "VERSION=$COMMIT_HASH" >> $GITHUB_ENV
+          
+          # 创建 Release Tag 和 Name
+          RELEASE_TAG="snapshot-$(date +%Y%m%d)-${COMMIT_HASH}"
+          RELEASE_NAME="BiliRoaming Snapshot Build (${COMMIT_HASH})"
+          
+          # 将这两个变量设置为步骤输出，供后续 Release 步骤使用
+          echo "tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+          echo "name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-${{ github.sha }}
+          restore-keys: ${{ runner.os }}
+
+      - name: Write key (If Secrets are provided)
+        # 只有在 master 分支或 tag 触发，并且配置了签名密钥的情况下才尝试写入
+        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/master' ) || github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' }}
+        run: |
+          if [ ! -z "${{ secrets.SIGNING_KEY }}" ]; then
+            echo 'Writing sign key'
+            echo releaseStorePassword='${{ secrets.KEY_STORE_PASSWORD }}' >> gradle.properties
+            echo releaseKeyAlias='${{ secrets.ALIAS }}' >> gradle.properties
+            echo releaseKeyPassword='${{ secrets.KEY_PASSWORD }}' >> gradle.properties
+            echo releaseStoreFile='key.jks' >> gradle.properties
+            echo '${{ secrets.SIGNING_KEY }}' | base64 --decode > key.jks
+          fi
+
+      - name: Build with Gradle
+        run: |
+          sudo rm -rf $ANDROID_HOME/cmake
+          echo 'org.gradle.caching=true' >> gradle.properties
+          echo 'org.gradle.parallel=true' >> gradle.properties
+          echo 'org.gradle.vfs.watch=true' >> gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx2048m' >> gradle.properties
+          echo 'android.native.buildOutput=verbose' >> gradle.properties
+          # 使用 VERSION 环境变量构建
+          ./gradlew -PappVerName=${{ env.VERSION }} assembleRelease assembleDebug
+
+      # ----------------------------------------------------
+      # 2. 自动创建 GitHub Release 并上传 APK
+      # ----------------------------------------------------
+      - name: Create GitHub Release and Upload Assets
+        # 仅在构建成功时运行
+        if: success()
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # 使用上一步生成的唯一标签
+          tag_name: ${{ steps.version_info.outputs.tag }}
+          name: ${{ steps.version_info.outputs.name }}
+          # 如果是手动触发 (workflow_dispatch)，设置为草稿，方便审核
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: true
+          body: |
+            ## 🚀 BiliRoaming Snapshot Build
+            
+            基于最新提交 `${{ env.VERSION }}` 的快照构建。
+            
+            - **Debug APK:** 适用于大多数用户，无需签名。
+            - **Release APK:** 仅在配置了签名密钥时可用。
+            
+            Commit Message:
+            ```
+            ${{ github.event.head_commit.message }}
+            ```
+
+          # 上传 APK 文件。使用通配符捕获 Release 和 Debug APK
+          files: |
+            app/release/app-release.apk
+            app/build/outputs/apk/debug/app-debug.apk
+      
+      # ----------------------------------------------------
+      # 3. 移除原有的 Upload Artifact 和 Telegram 推送步骤
+      # ----------------------------------------------------
+      # 原有的 'Upload built apk' 步骤被替换为 Create GitHub Release 
+      # 原有的 'Post to channel' 步骤已移除
